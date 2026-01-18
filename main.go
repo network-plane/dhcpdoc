@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"strings"
@@ -39,33 +40,37 @@ var (
 
 func main() {
 	root := &cobra.Command{
-		Use:   "dhcptool",
+		Use:   "dhcpdoc",
 		Short: "DHCPv4 testing client (discover/getip/test)",
 	}
 	root.PersistentFlags().StringVarP(&ifaceName, "iface", "i", "", "Network interface (default: first UP non-loopback with MAC)")
 	root.PersistentFlags().BoolVar(&debug, "debug", false, "Enable verbose debug output")
 
 	disc := &cobra.Command{
-		Use:   "discover",
-		Short: "Continuously discover DHCP servers and print all offers (Ctrl+C to stop)",
-		RunE:  runDiscover,
+		Use:          "discover",
+		Short:        "Continuously discover DHCP servers and print all offers (Ctrl+C to stop)",
+		RunE:         runDiscover,
+		SilenceUsage: true,
 	}
 	disc.Flags().DurationVar(&interval, "interval", 5*time.Second, "Interval between discover rounds")
 	disc.Flags().DurationVar(&timeout, "listen-timeout", 2*time.Second, "Listen duration per round for offers")
 
 	getip := &cobra.Command{
-		Use:   "getip",
-		Short: "Obtain an IP lease; optionally target a server, request an IP, or spoof MAC",
-		RunE:  runGetIP,
+		Use:          "getip",
+		Short:        "Obtain an IP lease; optionally target a server, request an IP, or spoof MAC",
+		RunE:         runGetIP,
+		SilenceUsage: true,
 	}
 	getip.Flags().String("server", "", "DHCP server IP to prefer")
 	getip.Flags().String("ip", "", "Specific IP to request (Option 50)")
 	getip.Flags().String("mac", "", "Spoof client MAC (e.g., 02:00:de:ad:be:ef)")
+	getip.Flags().Duration("timeout", 3*time.Second, "Timeout to wait for DHCP offer")
 
 	testCmd := &cobra.Command{
-		Use:   "test",
-		Short: "Validate DHCP servers and replies (discover, optional request, multi-round report)",
-		RunE:  runTest,
+		Use:          "test",
+		Short:        "Validate DHCP servers and replies (discover, optional request, multi-round report)",
+		RunE:         runTest,
+		SilenceUsage: true,
 	}
 	testCmd.Flags().DurationVar(&timeout, "timeout", 3*time.Second, "Capture window for offers per round")
 	testCmd.Flags().IntVar(&testRounds, "rounds", 1, "Number of discover rounds")
@@ -89,6 +94,8 @@ func main() {
 // =============================
 
 func runDiscover(cmd *cobra.Command, args []string) error {
+	warnFirewall()
+
 	iface, hw, err := pickInterface(ifaceName)
 	if err != nil {
 		return err
@@ -97,12 +104,11 @@ func runDiscover(cmd *cobra.Command, args []string) error {
 		fmt.Printf("[debug] using iface=%s hw=%s\n", iface.Name, hw.String())
 	}
 
-	laddr := &net.UDPAddr{IP: net.IPv4zero, Port: 68}
 	raddr := &net.UDPAddr{IP: net.IPv4bcast, Port: 67}
 
-	conn, err := net.ListenUDP("udp4", laddr)
+	conn, err := createDHCPConn(iface)
 	if err != nil {
-		return fmt.Errorf("bind udp/68: %w (need root and ensure no other DHCP client is bound)", err)
+		return err
 	}
 	defer conn.Close()
 
@@ -119,7 +125,7 @@ func runDiscover(cmd *cobra.Command, args []string) error {
 		}
 
 		xid := randomXID()
-		discover, err := dhcpv4.NewDiscovery(hw)
+		discover, err := dhcpv4.NewDiscovery(hw, dhcpv4.WithBroadcast(true))
 		if err != nil {
 			if debug {
 				fmt.Printf("[debug] build discover: %v\n", err)
@@ -138,7 +144,7 @@ func runDiscover(cmd *cobra.Command, args []string) error {
 		))
 		wire := discover.ToBytes()
 		if debug {
-			fmt.Printf("[debug] sending DHCPDISCOVER xid=%x (%d bytes)\n%s\n", xid, len(wire), prettyPacket(discover))
+			fmt.Printf("[debug] sending DHCPDISCOVER xid=0x%08x (%d bytes)\n%s\n", xidToUint32(xid), len(wire), prettyPacket(discover))
 		}
 		_, _ = conn.WriteToUDP(wire, raddr)
 
@@ -181,7 +187,9 @@ func runDiscover(cmd *cobra.Command, args []string) error {
 // =============================
 
 func runGetIP(cmd *cobra.Command, args []string) error {
-	_, hw, err := pickInterface(ifaceName)
+	warnFirewall()
+
+	iface, hw, err := pickInterface(ifaceName)
 	if err != nil {
 		return err
 	}
@@ -189,6 +197,7 @@ func runGetIP(cmd *cobra.Command, args []string) error {
 	flagServer, _ := cmd.Flags().GetString("server")
 	flagIP, _ := cmd.Flags().GetString("ip")
 	flagMAC, _ := cmd.Flags().GetString("mac")
+	flagTimeout, _ := cmd.Flags().GetDuration("timeout")
 
 	if flagMAC != "" {
 		m, err := net.ParseMAC(flagMAC)
@@ -214,15 +223,14 @@ func runGetIP(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	laddr := &net.UDPAddr{IP: net.IPv4zero, Port: 68}
 	raddr := &net.UDPAddr{IP: net.IPv4bcast, Port: 67}
-	conn, err := net.ListenUDP("udp4", laddr)
+	conn, err := createDHCPConn(iface)
 	if err != nil {
-		return fmt.Errorf("bind udp/68: %w", err)
+		return err
 	}
 	defer conn.Close()
 
-	offer, server, _, err := doDiscoverOnce(conn, hw, requestedIP, targetServer, timeout)
+	offer, server, _, err := doDiscoverOnce(conn, hw, requestedIP, targetServer, flagTimeout)
 	if err != nil {
 		return err
 	}
@@ -314,14 +322,15 @@ type TestReport struct {
 }
 
 func runTest(cmd *cobra.Command, args []string) error {
+	warnFirewall()
+
 	ifi, hw, err := pickInterface(ifaceName)
 	if err != nil {
 		return err
 	}
-	laddr := &net.UDPAddr{IP: net.IPv4zero, Port: 68}
-	conn, err := net.ListenUDP("udp4", laddr)
+	conn, err := createDHCPConn(ifi)
 	if err != nil {
-		return fmt.Errorf("bind udp/68: %w", err)
+		return err
 	}
 	defer conn.Close()
 
@@ -453,7 +462,7 @@ func runTest(cmd *cobra.Command, args []string) error {
 func doDiscoverOnce(conn *net.UDPConn, hw net.HardwareAddr, requestedIP net.IP, targetServer net.IP, listen time.Duration) (*dhcpv4.DHCPv4, net.IP, time.Duration, error) {
 	raddr := &net.UDPAddr{IP: net.IPv4bcast, Port: 67}
 	xid := randomXID()
-	discover, err := dhcpv4.NewDiscovery(hw)
+	discover, err := dhcpv4.NewDiscovery(hw, dhcpv4.WithBroadcast(true))
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -466,6 +475,9 @@ func doDiscoverOnce(conn *net.UDPConn, hw net.HardwareAddr, requestedIP net.IP, 
 		dhcpv4.OptionDomainName, dhcpv4.OptionServerIdentifier, dhcpv4.OptionBroadcastAddress,
 	))
 	start := time.Now()
+	if debug {
+		fmt.Printf("[debug] doDiscoverOnce: sending DHCPDISCOVER xid=0x%08x hw=%s\n", xidToUint32(xid), hw)
+	}
 	if _, err := conn.WriteToUDP(discover.ToBytes(), raddr); err != nil {
 		return nil, nil, 0, fmt.Errorf("send discover: %w", err)
 	}
@@ -477,10 +489,25 @@ func doDiscoverOnce(conn *net.UDPConn, hw net.HardwareAddr, requestedIP net.IP, 
 		buf := make([]byte, 3000)
 		n, src, rerr := conn.ReadFromUDP(buf)
 		if rerr != nil {
+			if debug {
+				fmt.Printf("[debug] doDiscoverOnce: read error (timeout?): %v\n", rerr)
+			}
 			break
 		}
+		if debug {
+			fmt.Printf("[debug] doDiscoverOnce: received %d bytes from %s\n", n, src)
+		}
 		pkt, perr := dhcpv4.FromBytes(buf[:n])
-		if perr != nil || pkt.TransactionID != xid || pkt.MessageType() != dhcpv4.MessageTypeOffer {
+		if perr != nil {
+			if debug {
+				fmt.Printf("[debug] doDiscoverOnce: parse error: %v\n", perr)
+			}
+			continue
+		}
+		if debug {
+			fmt.Printf("[debug] doDiscoverOnce: parsed packet type=%s xid=0x%08x (want 0x%08x)\n", pkt.MessageType(), xidToUint32(pkt.TransactionID), xidToUint32(xid))
+		}
+		if pkt.TransactionID != xid || pkt.MessageType() != dhcpv4.MessageTypeOffer {
 			continue
 		}
 		sid := pkt.ServerIdentifier()
@@ -988,6 +1015,10 @@ func randomXID() dhcpv4.TransactionID {
 	return xid
 }
 
+func xidToUint32(xid dhcpv4.TransactionID) uint32 {
+	return uint32(xid[0])<<24 | uint32(xid[1])<<16 | uint32(xid[2])<<8 | uint32(xid[3])
+}
+
 // ----- ARP probe (Linux only; best-effort) -----
 func arpProbe(ifi *net.Interface, srcMAC net.HardwareAddr, targetIP net.IP) error {
 	if runtime.GOOS != "linux" {
@@ -1056,3 +1087,117 @@ func arpProbe(ifi *net.Interface, srcMAC net.HardwareAddr, targetIP net.IP) erro
 }
 
 func htons(v uint16) uint16 { return (v<<8)&0xff00 | v>>8 }
+
+// checkFirewall checks if firewall rules might be blocking DHCP traffic
+func checkFirewall() []string {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+
+	var warnings []string
+
+	// Check iptables INPUT chain for potential blocks on UDP 68
+	if out, err := exec.Command("iptables", "-L", "INPUT", "-n", "-v").Output(); err == nil {
+		lines := strings.Split(string(out), "\n")
+		for _, line := range lines {
+			lower := strings.ToLower(line)
+			// Look for DROP/REJECT rules that might affect UDP 68
+			if (strings.Contains(lower, "drop") || strings.Contains(lower, "reject")) &&
+				(strings.Contains(line, "udp") || strings.Contains(lower, "all")) {
+				// Check if it's a blanket rule or specifically targeting port 68
+				if strings.Contains(line, "68") || strings.Contains(line, "0.0.0.0/0") {
+					warnings = append(warnings, fmt.Sprintf("iptables: potential block rule: %s", strings.TrimSpace(line)))
+				}
+			}
+		}
+	}
+
+	// Check nftables
+	if out, err := exec.Command("nft", "list", "ruleset").Output(); err == nil {
+		outStr := string(out)
+		if strings.Contains(outStr, "drop") || strings.Contains(outStr, "reject") {
+			if strings.Contains(outStr, "udp") && (strings.Contains(outStr, "68") || strings.Contains(outStr, "bootpc")) {
+				warnings = append(warnings, "nftables: rules may be blocking UDP port 68 (DHCP client)")
+			}
+		}
+	}
+
+	// Check if firewalld is running and DHCP isn't allowed
+	if out, err := exec.Command("firewall-cmd", "--state").Output(); err == nil {
+		if strings.TrimSpace(string(out)) == "running" {
+			// Check if dhcp-client service is allowed
+			if out2, err := exec.Command("firewall-cmd", "--list-services").Output(); err == nil {
+				if !strings.Contains(string(out2), "dhcp") {
+					warnings = append(warnings, "firewalld: running but 'dhcp-client' service may not be allowed (try: firewall-cmd --add-service=dhcp-client)")
+				}
+			}
+			// Also check if UDP 68 is open
+			if out3, err := exec.Command("firewall-cmd", "--list-ports").Output(); err == nil {
+				if !strings.Contains(string(out3), "68/udp") {
+					warnings = append(warnings, "firewalld: UDP port 68 not explicitly opened (try: firewall-cmd --add-port=68/udp)")
+				}
+			}
+		}
+	}
+
+	// Check for conntrack issues - DHCP uses 0.0.0.0 as source which can confuse stateful firewalls
+	if _, err := exec.Command("which", "conntrack").Output(); err == nil {
+		warnings = append(warnings, "Note: DHCP uses 0.0.0.0 as source IP which may confuse stateful firewalls; ensure DHCP traffic is allowed")
+	}
+
+	return warnings
+}
+
+// warnFirewall prints firewall warnings if any are detected
+func warnFirewall() {
+	warnings := checkFirewall()
+	if len(warnings) > 0 {
+		fmt.Fprintln(os.Stderr, "⚠ Firewall warnings (may prevent receiving DHCP replies):")
+		for _, w := range warnings {
+			fmt.Fprintf(os.Stderr, "  • %s\n", w)
+		}
+		fmt.Fprintln(os.Stderr, "")
+	}
+}
+
+// createDHCPConn creates a UDP connection suitable for DHCP with proper socket options
+func createDHCPConn(iface *net.Interface) (*net.UDPConn, error) {
+	laddr := &net.UDPAddr{IP: net.IPv4zero, Port: 68}
+
+	// Use ListenConfig to set socket options before bind
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var sockErr error
+			err := c.Control(func(fd uintptr) {
+				// Allow address reuse
+				if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+					sockErr = fmt.Errorf("SO_REUSEADDR: %w", err)
+					return
+				}
+				// Enable broadcast
+				if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1); err != nil {
+					sockErr = fmt.Errorf("SO_BROADCAST: %w", err)
+					return
+				}
+				// Bind to specific interface (Linux only, critical for receiving broadcast replies)
+				if runtime.GOOS == "linux" && iface != nil {
+					if err := syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, iface.Name); err != nil {
+						sockErr = fmt.Errorf("SO_BINDTODEVICE: %w", err)
+						return
+					}
+				}
+			})
+			if err != nil {
+				return err
+			}
+			return sockErr
+		},
+	}
+
+	conn, err := lc.ListenPacket(context.Background(), "udp4", laddr.String())
+	if err != nil {
+		return nil, fmt.Errorf("bind udp/68: %w (need root and ensure no other DHCP client is bound)", err)
+	}
+
+	return conn.(*net.UDPConn), nil
+}
