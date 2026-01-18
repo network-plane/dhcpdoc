@@ -22,6 +22,8 @@ import (
 )
 
 var (
+	appVersion = "1.1.21"
+
 	ifaceName string
 	debug     bool
 	timeout   time.Duration
@@ -39,11 +41,18 @@ var (
 
 func main() {
 	root := &cobra.Command{
-		Use:   "dhcpdoc",
-		Short: "DHCPv4 testing client (discover/getip/test)",
+		Use:     "dhcpdoc",
+		Short:   "DHCPv4 testing client (discover/getip/test)",
+		Version: appVersion,
 	}
-	root.PersistentFlags().StringVarP(&ifaceName, "iface", "i", "", "Network interface (default: first UP non-loopback with MAC)")
+	root.PersistentFlags().StringVar(&ifaceName, "iface", "", "Network interface (default: first UP non-loopback with MAC)")
 	root.PersistentFlags().BoolVar(&debug, "debug", false, "Enable verbose debug output")
+
+	// Remove short flags from help and version
+	root.InitDefaultHelpFlag()
+	root.InitDefaultVersionFlag()
+	root.Flags().Lookup("help").Shorthand = ""
+	root.Flags().Lookup("version").Shorthand = ""
 
 	disc := &cobra.Command{
 		Use:          "discover",
