@@ -39,33 +39,37 @@ var (
 
 func main() {
 	root := &cobra.Command{
-		Use:   "dhcptool",
+		Use:   "dhcpdoc",
 		Short: "DHCPv4 testing client (discover/getip/test)",
 	}
 	root.PersistentFlags().StringVarP(&ifaceName, "iface", "i", "", "Network interface (default: first UP non-loopback with MAC)")
 	root.PersistentFlags().BoolVar(&debug, "debug", false, "Enable verbose debug output")
 
 	disc := &cobra.Command{
-		Use:   "discover",
-		Short: "Continuously discover DHCP servers and print all offers (Ctrl+C to stop)",
-		RunE:  runDiscover,
+		Use:          "discover",
+		Short:        "Continuously discover DHCP servers and print all offers (Ctrl+C to stop)",
+		RunE:         runDiscover,
+		SilenceUsage: true,
 	}
 	disc.Flags().DurationVar(&interval, "interval", 5*time.Second, "Interval between discover rounds")
 	disc.Flags().DurationVar(&timeout, "listen-timeout", 2*time.Second, "Listen duration per round for offers")
 
 	getip := &cobra.Command{
-		Use:   "getip",
-		Short: "Obtain an IP lease; optionally target a server, request an IP, or spoof MAC",
-		RunE:  runGetIP,
+		Use:          "getip",
+		Short:        "Obtain an IP lease; optionally target a server, request an IP, or spoof MAC",
+		RunE:         runGetIP,
+		SilenceUsage: true,
 	}
 	getip.Flags().String("server", "", "DHCP server IP to prefer")
 	getip.Flags().String("ip", "", "Specific IP to request (Option 50)")
 	getip.Flags().String("mac", "", "Spoof client MAC (e.g., 02:00:de:ad:be:ef)")
+	getip.Flags().Duration("timeout", 3*time.Second, "Timeout to wait for DHCP offer")
 
 	testCmd := &cobra.Command{
-		Use:   "test",
-		Short: "Validate DHCP servers and replies (discover, optional request, multi-round report)",
-		RunE:  runTest,
+		Use:          "test",
+		Short:        "Validate DHCP servers and replies (discover, optional request, multi-round report)",
+		RunE:         runTest,
+		SilenceUsage: true,
 	}
 	testCmd.Flags().DurationVar(&timeout, "timeout", 3*time.Second, "Capture window for offers per round")
 	testCmd.Flags().IntVar(&testRounds, "rounds", 1, "Number of discover rounds")
@@ -79,7 +83,6 @@ func main() {
 	root.AddCommand(disc, getip, testCmd)
 
 	if err := root.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
@@ -97,12 +100,17 @@ func runDiscover(cmd *cobra.Command, args []string) error {
 		fmt.Printf("[debug] using iface=%s hw=%s\n", iface.Name, hw.String())
 	}
 
-	laddr := &net.UDPAddr{IP: net.IPv4zero, Port: 68}
+	// Use raw sockets on Linux to bypass firewall
+	if runtime.GOOS == "linux" {
+		return runDiscoverRaw(iface, hw)
+	}
+
+	// Fallback to UDP sockets on other platforms
 	raddr := &net.UDPAddr{IP: net.IPv4bcast, Port: 67}
 
-	conn, err := net.ListenUDP("udp4", laddr)
+	conn, err := createDHCPConn(iface)
 	if err != nil {
-		return fmt.Errorf("bind udp/68: %w (need root and ensure no other DHCP client is bound)", err)
+		return err
 	}
 	defer conn.Close()
 
@@ -119,7 +127,7 @@ func runDiscover(cmd *cobra.Command, args []string) error {
 		}
 
 		xid := randomXID()
-		discover, err := dhcpv4.NewDiscovery(hw)
+		discover, err := dhcpv4.NewDiscovery(hw, dhcpv4.WithBroadcast(true))
 		if err != nil {
 			if debug {
 				fmt.Printf("[debug] build discover: %v\n", err)
@@ -138,7 +146,7 @@ func runDiscover(cmd *cobra.Command, args []string) error {
 		))
 		wire := discover.ToBytes()
 		if debug {
-			fmt.Printf("[debug] sending DHCPDISCOVER xid=%x (%d bytes)\n%s\n", xid, len(wire), prettyPacket(discover))
+			fmt.Printf("[debug] sending DHCPDISCOVER xid=0x%08x (%d bytes)\n%s\n", xidToUint32(xid), len(wire), prettyPacket(discover))
 		}
 		_, _ = conn.WriteToUDP(wire, raddr)
 
@@ -176,12 +184,98 @@ func runDiscover(cmd *cobra.Command, args []string) error {
 	}
 }
 
+func runDiscoverRaw(iface *net.Interface, hw net.HardwareAddr) error {
+	conn, err := newRawDHCPConn(iface)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Println("Listening for DHCP servers (Ctrl+C to stop)...")
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("\nstopping discover.")
+			return nil
+		default:
+		}
+
+		xid := randomXID()
+		discover, err := dhcpv4.NewDiscovery(hw, dhcpv4.WithBroadcast(true))
+		if err != nil {
+			if debug {
+				fmt.Printf("[debug] build discover: %v\n", err)
+			}
+			time.Sleep(interval)
+			continue
+		}
+		discover.TransactionID = xid
+		discover.UpdateOption(dhcpv4.OptParameterRequestList(
+			dhcpv4.OptionSubnetMask,
+			dhcpv4.OptionRouter,
+			dhcpv4.OptionDomainNameServer,
+			dhcpv4.OptionDomainName,
+			dhcpv4.OptionServerIdentifier,
+			dhcpv4.OptionBroadcastAddress,
+		))
+		wire := discover.ToBytes()
+		if debug {
+			fmt.Printf("[debug] sending DHCPDISCOVER xid=0x%08x (%d bytes)\n%s\n", xidToUint32(xid), len(wire), prettyPacket(discover))
+		}
+
+		if err := conn.sendDHCP(wire, hw); err != nil {
+			if debug {
+				fmt.Printf("[debug] send error: %v\n", err)
+			}
+			time.Sleep(interval)
+			continue
+		}
+
+		_ = conn.SetReadTimeout(timeout)
+		roundStart := time.Now()
+		deadline := time.Now().Add(timeout)
+
+		for time.Now().Before(deadline) {
+			dhcpBytes, err := conn.recvDHCP()
+			if err != nil {
+				continue
+			}
+			pkt, perr := dhcpv4.FromBytes(dhcpBytes)
+			if perr != nil || pkt.MessageType() != dhcpv4.MessageTypeOffer || pkt.TransactionID != xid {
+				continue
+			}
+
+			server := pkt.ServerIPAddr
+			if sid := pkt.ServerIdentifier(); sid != nil {
+				server = sid
+			}
+			offerIP := pkt.YourIPAddr
+			host := pkt.Options.Get(dhcpv4.OptionHostName)
+			lat := time.Since(roundStart)
+
+			fmt.Printf("OFFER from %s → yiaddr=%s (latency=%s)", server, offerIP, lat.Round(time.Millisecond))
+			if len(host) > 0 {
+				fmt.Printf(" host=%q", string(host))
+			}
+			fmt.Println()
+			if debug {
+				fmt.Println(prettyPacket(pkt))
+			}
+		}
+
+		time.Sleep(interval)
+	}
+}
+
 // =============================
 // getip
 // =============================
 
 func runGetIP(cmd *cobra.Command, args []string) error {
-	_, hw, err := pickInterface(ifaceName)
+	iface, hw, err := pickInterface(ifaceName)
 	if err != nil {
 		return err
 	}
@@ -189,6 +283,7 @@ func runGetIP(cmd *cobra.Command, args []string) error {
 	flagServer, _ := cmd.Flags().GetString("server")
 	flagIP, _ := cmd.Flags().GetString("ip")
 	flagMAC, _ := cmd.Flags().GetString("mac")
+	flagTimeout, _ := cmd.Flags().GetDuration("timeout")
 
 	if flagMAC != "" {
 		m, err := net.ParseMAC(flagMAC)
@@ -214,15 +309,20 @@ func runGetIP(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	laddr := &net.UDPAddr{IP: net.IPv4zero, Port: 68}
+	// Use raw sockets on Linux to bypass firewall
+	if runtime.GOOS == "linux" {
+		return runGetIPRaw(iface, hw, requestedIP, targetServer, flagTimeout)
+	}
+
+	// Fallback to UDP sockets on other platforms
 	raddr := &net.UDPAddr{IP: net.IPv4bcast, Port: 67}
-	conn, err := net.ListenUDP("udp4", laddr)
+	conn, err := createDHCPConn(iface)
 	if err != nil {
-		return fmt.Errorf("bind udp/68: %w", err)
+		return err
 	}
 	defer conn.Close()
 
-	offer, server, _, err := doDiscoverOnce(conn, hw, requestedIP, targetServer, timeout)
+	offer, server, _, err := doDiscoverOnce(conn, hw, requestedIP, targetServer, flagTimeout)
 	if err != nil {
 		return err
 	}
@@ -267,6 +367,38 @@ func runGetIP(cmd *cobra.Command, args []string) error {
 			return errors.New("NAK: server declined the request")
 		}
 	}
+}
+
+func runGetIPRaw(iface *net.Interface, hw net.HardwareAddr, requestedIP, targetServer net.IP, timeout time.Duration) error {
+	conn, err := newRawDHCPConn(iface)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if debug {
+		fmt.Printf("[debug] using raw sockets on iface=%s hw=%s\n", iface.Name, hw)
+	}
+
+	offer, server, _, err := doDiscoverOnceRaw(conn, hw, requestedIP, targetServer, timeout)
+	if err != nil {
+		return err
+	}
+	if debug {
+		fmt.Printf("[debug] selected OFFER yiaddr=%s from %s\n", offer.YourIPAddr, server)
+		fmt.Println(prettyPacket(offer))
+	}
+
+	_, ack, err := doRequestOnceRaw(conn, hw, offer)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("ACK: leased %s\n", ack.YourIPAddr)
+	if debug {
+		fmt.Println(prettyPacket(ack))
+	}
+	return nil
 }
 
 // =============================
@@ -318,10 +450,15 @@ func runTest(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	laddr := &net.UDPAddr{IP: net.IPv4zero, Port: 68}
-	conn, err := net.ListenUDP("udp4", laddr)
+
+	// Use raw sockets on Linux to bypass firewall
+	if runtime.GOOS == "linux" {
+		return runTestRaw(ifi, hw)
+	}
+
+	conn, err := createDHCPConn(ifi)
 	if err != nil {
-		return fmt.Errorf("bind udp/68: %w", err)
+		return err
 	}
 	defer conn.Close()
 
@@ -448,12 +585,142 @@ func runTest(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func runTestRaw(ifi *net.Interface, hw net.HardwareAddr) error {
+	conn, err := newRawDHCPConn(ifi)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	var targetServer net.IP
+	if testServer != "" {
+		targetServer = net.ParseIP(testServer)
+		if targetServer == nil || targetServer.To4() == nil {
+			return fmt.Errorf("invalid --server: %q", testServer)
+		}
+	}
+
+	report := TestReport{Interface: ifi.Name, Rounds: testRounds}
+	agg := map[string]*PerServerAggregate{}
+
+	for round := 0; round < testRounds; round++ {
+		offer, server, latency, err := doDiscoverOnceRaw(conn, hw, nil, targetServer, timeout)
+		if err != nil {
+			continue
+		}
+
+		roundRes := validateOffer(offer, server, latency)
+
+		// Optional ARP probe
+		if testARP {
+			if err := arpProbe(ifi, hw, offer.YourIPAddr); err != nil {
+				roundRes.Checks = append(roundRes.Checks, Check{"arp_probe", "WARN", fmt.Sprintf("probe issue: %v", err)})
+			} else {
+				roundRes.Checks = append(roundRes.Checks, Check{"arp_probe", "OK", "no ARP reply (free)"})
+			}
+		}
+
+		// Optional REQUEST/ACK
+		if testDoRequest {
+			startReq := time.Now()
+			req, ack, err := doRequestOnceRaw(conn, hw, offer)
+			if err != nil {
+				roundRes.Checks = append(roundRes.Checks, Check{"request_ack", "ERR", err.Error()})
+			} else {
+				ackLat := time.Since(startReq)
+				roundRes.Checks = append(roundRes.Checks, Check{"request_ack", "OK", "ACK received"})
+				roundRes.Checks = append(roundRes.Checks, Check{"ack_latency", "OK", ackLat.Round(time.Millisecond).String()})
+				validateACK(offer, req, ack, &roundRes)
+			}
+		}
+
+		report.Results = append(report.Results, roundRes)
+
+		// Aggregate stats
+		skey := server.String()
+		if agg[skey] == nil {
+			agg[skey] = &PerServerAggregate{Server: skey, MinLatencyMS: 1 << 62}
+		}
+		a := agg[skey]
+		a.OfferCount++
+		a.OfferIPs = appendUnique(a.OfferIPs, offer.YourIPAddr.String())
+		subnet := inferSubnet(offer)
+		a.Subnets = appendUnique(a.Subnets, subnet)
+		ms := latency.Milliseconds()
+		a.AvgLatencyMS += ms
+		if ms < a.MinLatencyMS {
+			a.MinLatencyMS = ms
+		}
+		if ms > a.MaxLatencyMS {
+			a.MaxLatencyMS = ms
+		}
+	}
+
+	// Finalize aggregates
+	for _, a := range agg {
+		if a.OfferCount > 0 {
+			a.AvgLatencyMS = a.AvgLatencyMS / int64(a.OfferCount)
+			a.UnstableSubnets = len(a.Subnets) > 1
+			a.UnstableIP = len(a.OfferIPs) > 1
+			report.Summary = append(report.Summary, *a)
+		}
+	}
+
+	// Count severities
+	for _, r := range report.Results {
+		for _, c := range r.Checks {
+			switch c.Level {
+			case "ERR":
+				report.Errors++
+			case "WARN":
+				report.Warnings++
+			}
+		}
+	}
+
+	if testJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(report)
+	}
+
+	// Human-friendly output
+	fmt.Printf("== DHCP Server Test Report (iface=%s, rounds=%d) ==\n", report.Interface, report.Rounds)
+	for _, r := range report.Results {
+		fmt.Printf("\nServer: %s  Offer: %s  Latency=%dms\n", r.Server, r.OfferIP, r.LatencyMS)
+		for _, c := range r.Checks {
+			fmt.Printf("  [%s] %-16s %s\n", c.Level, c.Name, c.Msg)
+		}
+	}
+	if len(report.Summary) > 0 {
+		fmt.Println("\n-- Summary --")
+		for _, s := range report.Summary {
+			fmt.Printf("Server %s: offers=%d, lat(ms) min/avg/max=%d/%d/%d, subnets=%v, ips=%v",
+				s.Server, s.OfferCount, s.MinLatencyMS, s.AvgLatencyMS, s.MaxLatencyMS, s.Subnets, s.OfferIPs)
+			if s.UnstableSubnets {
+				fmt.Printf("  [WARN subnet instability]")
+			}
+			if s.UnstableIP {
+				fmt.Printf("  [WARN IP churn]")
+			}
+			fmt.Println()
+		}
+	}
+	if report.Errors > 0 {
+		return fmt.Errorf("test found %d error(s), %d warning(s)", report.Errors, report.Warnings)
+	}
+	if report.Warnings > 0 {
+		fmt.Printf("Completed with %d warning(s)\n", report.Warnings)
+	}
+	return nil
+}
+
 // ----- test helpers -----
 
 func doDiscoverOnce(conn *net.UDPConn, hw net.HardwareAddr, requestedIP net.IP, targetServer net.IP, listen time.Duration) (*dhcpv4.DHCPv4, net.IP, time.Duration, error) {
 	raddr := &net.UDPAddr{IP: net.IPv4bcast, Port: 67}
 	xid := randomXID()
-	discover, err := dhcpv4.NewDiscovery(hw)
+	discover, err := dhcpv4.NewDiscovery(hw, dhcpv4.WithBroadcast(true))
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -466,6 +733,9 @@ func doDiscoverOnce(conn *net.UDPConn, hw net.HardwareAddr, requestedIP net.IP, 
 		dhcpv4.OptionDomainName, dhcpv4.OptionServerIdentifier, dhcpv4.OptionBroadcastAddress,
 	))
 	start := time.Now()
+	if debug {
+		fmt.Printf("[debug] doDiscoverOnce: sending DHCPDISCOVER xid=0x%08x hw=%s\n", xidToUint32(xid), hw)
+	}
 	if _, err := conn.WriteToUDP(discover.ToBytes(), raddr); err != nil {
 		return nil, nil, 0, fmt.Errorf("send discover: %w", err)
 	}
@@ -477,10 +747,25 @@ func doDiscoverOnce(conn *net.UDPConn, hw net.HardwareAddr, requestedIP net.IP, 
 		buf := make([]byte, 3000)
 		n, src, rerr := conn.ReadFromUDP(buf)
 		if rerr != nil {
+			if debug {
+				fmt.Printf("[debug] doDiscoverOnce: read error (timeout?): %v\n", rerr)
+			}
 			break
 		}
+		if debug {
+			fmt.Printf("[debug] doDiscoverOnce: received %d bytes from %s\n", n, src)
+		}
 		pkt, perr := dhcpv4.FromBytes(buf[:n])
-		if perr != nil || pkt.TransactionID != xid || pkt.MessageType() != dhcpv4.MessageTypeOffer {
+		if perr != nil {
+			if debug {
+				fmt.Printf("[debug] doDiscoverOnce: parse error: %v\n", perr)
+			}
+			continue
+		}
+		if debug {
+			fmt.Printf("[debug] doDiscoverOnce: parsed packet type=%s xid=0x%08x (want 0x%08x)\n", pkt.MessageType(), xidToUint32(pkt.TransactionID), xidToUint32(xid))
+		}
+		if pkt.TransactionID != xid || pkt.MessageType() != dhcpv4.MessageTypeOffer {
 			continue
 		}
 		sid := pkt.ServerIdentifier()
@@ -988,6 +1273,10 @@ func randomXID() dhcpv4.TransactionID {
 	return xid
 }
 
+func xidToUint32(xid dhcpv4.TransactionID) uint32 {
+	return uint32(xid[0])<<24 | uint32(xid[1])<<16 | uint32(xid[2])<<8 | uint32(xid[3])
+}
+
 // ----- ARP probe (Linux only; best-effort) -----
 func arpProbe(ifi *net.Interface, srcMAC net.HardwareAddr, targetIP net.IP) error {
 	if runtime.GOOS != "linux" {
@@ -1056,3 +1345,341 @@ func arpProbe(ifi *net.Interface, srcMAC net.HardwareAddr, targetIP net.IP) erro
 }
 
 func htons(v uint16) uint16 { return (v<<8)&0xff00 | v>>8 }
+
+// =============================
+// Raw socket DHCP (bypasses firewall)
+// =============================
+
+// rawDHCPConn holds state for raw socket DHCP communication
+type rawDHCPConn struct {
+	fd    int
+	iface *net.Interface
+	mac   net.HardwareAddr
+}
+
+// newRawDHCPConn creates a raw AF_PACKET socket for DHCP
+func newRawDHCPConn(iface *net.Interface) (*rawDHCPConn, error) {
+	if runtime.GOOS != "linux" {
+		return nil, errors.New("raw DHCP sockets only supported on Linux")
+	}
+
+	// ETH_P_IP = 0x0800
+	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(0x0800)))
+	if err != nil {
+		return nil, fmt.Errorf("raw socket: %w", err)
+	}
+
+	// Bind to interface
+	addr := syscall.SockaddrLinklayer{
+		Protocol: htons(0x0800),
+		Ifindex:  iface.Index,
+	}
+	if err := syscall.Bind(fd, &addr); err != nil {
+		syscall.Close(fd)
+		return nil, fmt.Errorf("bind to interface: %w", err)
+	}
+
+	return &rawDHCPConn{
+		fd:    fd,
+		iface: iface,
+		mac:   iface.HardwareAddr,
+	}, nil
+}
+
+func (r *rawDHCPConn) Close() error {
+	return syscall.Close(r.fd)
+}
+
+func (r *rawDHCPConn) SetReadTimeout(d time.Duration) error {
+	tv := syscall.Timeval{
+		Sec:  int64(d / time.Second),
+		Usec: int64((d % time.Second) / time.Microsecond),
+	}
+	return syscall.SetsockoptTimeval(r.fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
+}
+
+// sendDHCP sends a DHCP packet via raw socket
+func (r *rawDHCPConn) sendDHCP(dhcpPayload []byte, srcMAC net.HardwareAddr) error {
+	// Build: Ethernet + IP + UDP + DHCP
+	frame := buildDHCPFrame(srcMAC, dhcpPayload)
+
+	addr := syscall.SockaddrLinklayer{
+		Protocol: htons(0x0800),
+		Ifindex:  r.iface.Index,
+		Halen:    6,
+	}
+	// Broadcast destination
+	copy(addr.Addr[:], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+
+	return syscall.Sendto(r.fd, frame, 0, &addr)
+}
+
+// recvDHCP receives a DHCP packet via raw socket
+func (r *rawDHCPConn) recvDHCP() ([]byte, error) {
+	buf := make([]byte, 4096)
+	n, _, err := syscall.Recvfrom(r.fd, buf, 0)
+	if err != nil {
+		return nil, err
+	}
+	if n < 14+20+8 { // Eth + IP + UDP minimum
+		return nil, errors.New("packet too short")
+	}
+
+	// Parse Ethernet header
+	etherType := binary.BigEndian.Uint16(buf[12:14])
+	if etherType != 0x0800 {
+		return nil, errors.New("not IP packet")
+	}
+
+	// Parse IP header
+	ipStart := 14
+	if buf[ipStart]>>4 != 4 {
+		return nil, errors.New("not IPv4")
+	}
+	ipHdrLen := int(buf[ipStart]&0x0f) * 4
+	protocol := buf[ipStart+9]
+	if protocol != 17 { // UDP
+		return nil, errors.New("not UDP")
+	}
+
+	// Parse UDP header
+	udpStart := ipStart + ipHdrLen
+	if udpStart+8 > n {
+		return nil, errors.New("UDP header truncated")
+	}
+	srcPort := binary.BigEndian.Uint16(buf[udpStart : udpStart+2])
+	dstPort := binary.BigEndian.Uint16(buf[udpStart+2 : udpStart+4])
+
+	// DHCP: server sends from port 67, client receives on port 68
+	if srcPort != 67 || dstPort != 68 {
+		return nil, errors.New("not DHCP")
+	}
+
+	// Extract DHCP payload
+	dhcpStart := udpStart + 8
+	if dhcpStart >= n {
+		return nil, errors.New("no DHCP payload")
+	}
+
+	return buf[dhcpStart:n], nil
+}
+
+// buildDHCPFrame builds Ethernet + IP + UDP frame with DHCP payload
+func buildDHCPFrame(srcMAC net.HardwareAddr, dhcpPayload []byte) []byte {
+	udpLen := 8 + len(dhcpPayload)
+	ipLen := 20 + udpLen
+	frameLen := 14 + ipLen
+
+	frame := make([]byte, frameLen)
+
+	// Ethernet header (14 bytes)
+	copy(frame[0:6], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) // dst: broadcast
+	copy(frame[6:12], srcMAC)                                    // src
+	binary.BigEndian.PutUint16(frame[12:14], 0x0800)             // EtherType: IPv4
+
+	// IP header (20 bytes, no options)
+	ip := frame[14:]
+	ip[0] = 0x45                                       // Version 4, IHL 5
+	ip[1] = 0x00                                       // DSCP/ECN
+	binary.BigEndian.PutUint16(ip[2:4], uint16(ipLen)) // Total length
+	binary.BigEndian.PutUint16(ip[4:6], 0)             // ID
+	binary.BigEndian.PutUint16(ip[6:8], 0)             // Flags/Fragment
+	ip[8] = 64                                         // TTL
+	ip[9] = 17                                         // Protocol: UDP
+	// ip[10:12] = checksum (calculated below)
+	copy(ip[12:16], []byte{0, 0, 0, 0})         // Src: 0.0.0.0
+	copy(ip[16:20], []byte{255, 255, 255, 255}) // Dst: 255.255.255.255
+
+	// IP checksum
+	ipChecksum := ipHeaderChecksum(ip[:20])
+	binary.BigEndian.PutUint16(ip[10:12], ipChecksum)
+
+	// UDP header (8 bytes)
+	udp := frame[14+20:]
+	binary.BigEndian.PutUint16(udp[0:2], 68)             // Src port (DHCP client)
+	binary.BigEndian.PutUint16(udp[2:4], 67)             // Dst port (DHCP server)
+	binary.BigEndian.PutUint16(udp[4:6], uint16(udpLen)) // Length
+	binary.BigEndian.PutUint16(udp[6:8], 0)              // Checksum (0 = disabled for IPv4 UDP)
+
+	// DHCP payload
+	copy(frame[14+20+8:], dhcpPayload)
+
+	return frame
+}
+
+// ipHeaderChecksum calculates IP header checksum
+func ipHeaderChecksum(hdr []byte) uint16 {
+	var sum uint32
+	for i := 0; i < len(hdr); i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(hdr[i : i+2]))
+	}
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+// doDiscoverOnceRaw performs DHCP discover using raw sockets (bypasses firewall)
+func doDiscoverOnceRaw(conn *rawDHCPConn, hw net.HardwareAddr, requestedIP net.IP, targetServer net.IP, listen time.Duration) (*dhcpv4.DHCPv4, net.IP, time.Duration, error) {
+	xid := randomXID()
+	discover, err := dhcpv4.NewDiscovery(hw, dhcpv4.WithBroadcast(true))
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	discover.TransactionID = xid
+	if requestedIP != nil {
+		discover.UpdateOption(dhcpv4.OptRequestedIPAddress(requestedIP))
+	}
+	discover.UpdateOption(dhcpv4.OptParameterRequestList(
+		dhcpv4.OptionSubnetMask, dhcpv4.OptionRouter, dhcpv4.OptionDomainNameServer,
+		dhcpv4.OptionDomainName, dhcpv4.OptionServerIdentifier, dhcpv4.OptionBroadcastAddress,
+	))
+
+	if debug {
+		fmt.Printf("[debug] doDiscoverOnceRaw: sending DHCPDISCOVER xid=0x%08x hw=%s\n", xidToUint32(xid), hw)
+	}
+
+	start := time.Now()
+	if err := conn.sendDHCP(discover.ToBytes(), hw); err != nil {
+		return nil, nil, 0, fmt.Errorf("send discover: %w", err)
+	}
+
+	if err := conn.SetReadTimeout(listen); err != nil {
+		return nil, nil, 0, fmt.Errorf("set timeout: %w", err)
+	}
+
+	deadline := time.Now().Add(listen)
+	var chosen *dhcpv4.DHCPv4
+	var server net.IP
+
+	for time.Now().Before(deadline) {
+		dhcpBytes, err := conn.recvDHCP()
+		if err != nil {
+			if debug {
+				// Don't spam on timeout
+				if !strings.Contains(err.Error(), "resource temporarily unavailable") {
+					fmt.Printf("[debug] doDiscoverOnceRaw: recv error: %v\n", err)
+				}
+			}
+			continue
+		}
+
+		pkt, perr := dhcpv4.FromBytes(dhcpBytes)
+		if perr != nil {
+			if debug {
+				fmt.Printf("[debug] doDiscoverOnceRaw: parse error: %v\n", perr)
+			}
+			continue
+		}
+
+		if debug {
+			fmt.Printf("[debug] doDiscoverOnceRaw: got packet type=%s xid=0x%08x (want 0x%08x)\n",
+				pkt.MessageType(), xidToUint32(pkt.TransactionID), xidToUint32(xid))
+		}
+
+		if pkt.TransactionID != xid || pkt.MessageType() != dhcpv4.MessageTypeOffer {
+			continue
+		}
+
+		sid := pkt.ServerIdentifier()
+		if sid != nil {
+			server = sid
+		} else {
+			server = pkt.ServerIPAddr
+		}
+
+		if targetServer != nil && !server.Equal(targetServer) {
+			continue
+		}
+
+		chosen = pkt
+		break
+	}
+
+	if chosen == nil {
+		return nil, nil, 0, errors.New("no suitable DHCPOFFER received")
+	}
+	return chosen, server, time.Since(start), nil
+}
+
+// doRequestOnceRaw performs DHCP request using raw sockets
+func doRequestOnceRaw(conn *rawDHCPConn, hw net.HardwareAddr, offer *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4, *dhcpv4.DHCPv4, error) {
+	req, err := dhcpv4.NewRequestFromOffer(offer, dhcpv4.WithOption(dhcpv4.OptServerIdentifier(offer.ServerIdentifier())))
+	if err != nil {
+		return nil, nil, fmt.Errorf("build request: %w", err)
+	}
+	req.ClientHWAddr = hw
+	req.SetBroadcast()
+
+	if err := conn.sendDHCP(req.ToBytes(), hw); err != nil {
+		return nil, nil, fmt.Errorf("send request: %w", err)
+	}
+
+	if err := conn.SetReadTimeout(3 * time.Second); err != nil {
+		return nil, nil, fmt.Errorf("set timeout: %w", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		dhcpBytes, err := conn.recvDHCP()
+		if err != nil {
+			continue
+		}
+
+		pkt, perr := dhcpv4.FromBytes(dhcpBytes)
+		if perr != nil || pkt.TransactionID != req.TransactionID {
+			continue
+		}
+
+		switch pkt.MessageType() {
+		case dhcpv4.MessageTypeAck:
+			return req, pkt, nil
+		case dhcpv4.MessageTypeNak:
+			return req, nil, errors.New("NAK: server declined the request")
+		}
+	}
+
+	return req, nil, errors.New("no DHCPACK/NAK received")
+}
+
+// createDHCPConn creates a UDP connection suitable for DHCP with proper socket options
+func createDHCPConn(iface *net.Interface) (*net.UDPConn, error) {
+	laddr := &net.UDPAddr{IP: net.IPv4zero, Port: 68}
+
+	// Use ListenConfig to set socket options before bind
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var sockErr error
+			err := c.Control(func(fd uintptr) {
+				// Allow address reuse
+				if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+					sockErr = fmt.Errorf("SO_REUSEADDR: %w", err)
+					return
+				}
+				// Enable broadcast
+				if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1); err != nil {
+					sockErr = fmt.Errorf("SO_BROADCAST: %w", err)
+					return
+				}
+				// Bind to specific interface (Linux only, critical for receiving broadcast replies)
+				if runtime.GOOS == "linux" && iface != nil {
+					if err := syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, iface.Name); err != nil {
+						sockErr = fmt.Errorf("SO_BINDTODEVICE: %w", err)
+						return
+					}
+				}
+			})
+			if err != nil {
+				return err
+			}
+			return sockErr
+		},
+	}
+
+	conn, err := lc.ListenPacket(context.Background(), "udp4", laddr.String())
+	if err != nil {
+		return nil, fmt.Errorf("bind udp/68: %w (need root and ensure no other DHCP client is bound)", err)
+	}
+
+	return conn.(*net.UDPConn), nil
+}
